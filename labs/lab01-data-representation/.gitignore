@@ -1,5 +1,6 @@
 types
 representations
+binary
 bits
 characters
 signed_unsigned
