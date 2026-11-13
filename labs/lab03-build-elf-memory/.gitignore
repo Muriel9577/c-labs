@@ -1,0 +1,11 @@
+*.i
+*.s
+*.o
+program
+app
+sections
+process
+memory
+stack
+heap
+memory_map
