@@ -162,7 +162,7 @@ Dynamic linking дозволяє багатьом програмам викор�
 | main | code | code (`.text`) | так |
 | global_initialized | data | data (`.data`) | так |
 | global_uninitialized | heap | bss (`.bss`) | ні |
-| static_initialized | | data | data (`.data`) | так |
+| static_initialized | data | data (`.data`) | так |
 | static_uninitialized | data | bss (`.bss`) | ні |
 | local | stack | stack | так |
 | dynamic allocation | bss | heap | ні |
