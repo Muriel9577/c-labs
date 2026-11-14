@@ -121,9 +121,9 @@ CHILD:  PID=10355 value=200 address=0x593e2580e010
 
 Другий запуск: усі адреси інші (`0x603e8a04f010`), але знову однакові між parent та child.
 
-Прогноз не збігся:
+Прогноз збігся:
 
-- child надрукував 200, а не 300 (parent: 300);
+- child надрукував 200 (parent: 300);
 - адреси `&value` **однакові** у parent та child.
 
 Після `fork()` parent і child мають окремі address spaces, тому parent, який змінив `value`, не вплинув на child, і навпаки. Однакова virtual address у двох processes не означає ту саму змінювану область пам'яті: кожен process має свою таблицю відображення адрес (це тема virtual memory). Змінюється база між запусками через ASLR, але не між parent та child.
