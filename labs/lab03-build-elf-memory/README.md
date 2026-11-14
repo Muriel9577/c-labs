@@ -303,4 +303,4 @@ c: 0x617754bc22e0
 
 ## 11. Висновок
 
-У цій роботі я окремо виконав усі етапи від `program.c` до executable та побачив, чим відрізняються `.c`, `.i`, `.s`, `.o` та ELF. На linker error `undefined reference` я побачив роль symbols і linker. В ELF знайшов `.text`, `.rodata`, `.data`, `.bss` і перевірив, де лежать мої змінні. Експеримент з `large_array` показав, що `.bss` майже не збільшує файл, зате збільшує пам'ять процесу. Адреси в `memory`, `stack` та `heap` показали, що code, data/bss, heap і stack розташовані в різних областях address space. А ASLR змінює їх при кожному запуску.і
+У цій роботі я окремо виконав усі етапи від `program.c` до executable та побачив, чим відрізняються `.c`, `.i`, `.s`, `.o` та ELF. На linker error `undefined reference` я побачив роль symbols і linker. В ELF знайшов `.text`, `.rodata`, `.data`, `.bss` і перевірив, де лежать мої змінні. Експеримент з `large_array` показав, що `.bss` майже не збільшує файл, зате збільшує пам'ять процесу. Адреси в `memory`, `stack` та `heap` показали, що ASLR змінює розташування  code, data/bss, heap і stack  при кожному запуску.
