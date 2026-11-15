@@ -1,0 +1,349 @@
+# Lab 6. Virtual memory, file descriptors and I/O
+
+Середовище: GitHub Codespaces, Ubuntu 24.04, gcc 13.3.0, strace 6.8, x86-64. Розмір сторінки (`getconf PAGE_SIZE`) 4096 bytes.
+
+Executable files та згенеровані тестові файли у репозиторій не додаються (див. `.gitignore`). Окрім рекомендованих файлів, я створив `file_offset_lseek.c` (версія з `lseek()`) і `buffering_flush.c` (версія з `fflush()`).
+
+Прогнози записано вже після запуску програм (не до), тому вони не є «чистими» прогнозами. Для прогнозу 4 (buffering) я прогнозу не робив.
+
+# Частина I. Virtual memory
+
+## 1. Адреси з `memory_layout.c`
+
+| Об'єкт | Run 1 | Run 2 | Run 3 |
+|---|---|---|---|
+| function | 0x654bfd1581c9 | 0x5ce0950ab1c9 | 0x5fd8220b51c9 |
+| initialized global | 0x654bfd15b010 | 0x5ce0950ae010 | 0x5fd8220b8010 |
+| uninitialized global | 0x654bfd15b01c | 0x5ce0950ae01c | 0x5fd8220b801c |
+| static | 0x654bfd15b014 | 0x5ce0950ae014 | 0x5fd8220b8014 |
+| heap allocation | 0x654c239d52a0 | 0x5ce0d4bae2a0 | 0x5fd8385f52a0 |
+| local variable | 0x7ffd8456d80c | 0x7ffd9cc1ea4c | 0x7fffea4cfe8c |
+
+**Прогноз:** поряд лежать `uninitialized global`, `initialized global` і `static`; адреси між запусками різні.
+
+Аналіз:
+
+- **Поряд лежать:** `initialized global`, `static` і `uninitialized global` (`…b010`, `…b014`, `…b01c`): різниця лише в кількох байтах. `function` теж недалеко від них (різниця приблизно 0x2e47 = 11 847 bytes), це та сама область образу програми.
+- **Heap** (`0x654c239d52a0`) за значенням не схожа на адреси global змінних: вона вища приблизно на `0x2687a290` (близько 645 MB).
+- **Stack** (`0x7ffd…`) у зовсім іншій, значно вищій області.
+- **Між запусками адреси різні** (ASLR), але закінчення адрес (`…1c9`, `…010`, `…01c`, `…014`, `…2a0`) однакові: випадково змінюється лише база, а взаємне розташування в образі програми лишається тим самим.
+
+**Збіг з прогнозом:** так. Три змінні справді лежать поряд (`…b010`, `…b014`, `…b01c`), а база адрес у кожному запуску інша (ASLR).
+
+Значення, які друкує програма, — це **virtual addresses** в address space process, а не прямі адреси physical RAM.
+
+## 2. Зіставлення адрес з `/proc/PID/maps`
+
+Запуск `memory_maps` (PID 14893) надрукував:
+
+```
+main: 0x55a5f6bbf229
+global: 0x55a5f6bc2010
+heap: 0x55a61825e2a0
+stack: 0x7ffdcec6acac
+```
+
+Фрагмент `/proc/PID/maps`:
+
+```
+55a5f6bbe000-55a5f6bbf000 r--p ... memory_maps
+55a5f6bbf000-55a5f6bc0000 r-xp ... memory_maps
+55a5f6bc0000-55a5f6bc1000 r--p ... memory_maps
+55a5f6bc1000-55a5f6bc2000 r--p ... memory_maps
+55a5f6bc2000-55a5f6bc3000 rw-p ... memory_maps
+55a61825e000-55a61827f000 rw-p 00000000 00:00 0   [heap]
+77f6d1776000-77f6d179e000 r--p ... libc.so.6
+77f6d179e000-77f6d1927000 r-xp ... libc.so.6
+...
+7ffdcec4b000-7ffdcec6d000 rw-p 00000000 00:00 0   [stack]
+```
+
+| Об'єкт | Адреса | Mapping, у який вона потрапляє |
+|---|---|---|
+| main | 0x55a5f6bbf229 | `55a5f6bbf000-55a5f6bc0000 r-xp` (code executable) |
+| global | 0x55a5f6bc2010 | `55a5f6bc2000-55a5f6bc3000 rw-p` (writable data executable) |
+| heap | 0x55a61825e2a0 | `55a61825e000-55a61827f000 rw-p [heap]` |
+| stack | 0x7ffdcec6acac | `7ffdcec4b000-7ffdcec6d000 rw-p [stack]` |
+
+Так, адреса `heap` усередині `[heap]` (розмір цього mapping 0x21000 = 132 KiB), адреса `stack` усередині `[stack]`. Також у maps видно shared libraries (`libc.so.6`, `ld-linux-x86-64.so.2`) та службові області `[vvar]`, `[vdso]`, `[vsyscall]`.
+
+**Memory permissions.** `r-x` для code, `rw-` для даних, `r--` для константних даних. Code не обов'язково має бути writable, бо програма не повинна змінювати власні instructions (інакше помилка або атака могли б підмінити код). Data не обов'язково має бути executable, щоб дані, які записала програма чи зловмисник, не могли виконатися як код. Це і є memory protection: права доступу задаються на рівні сторінок, а `p` означає private mapping.
+
+## 3. Page size, page number, offset
+
+`getconf PAGE_SIZE` і `./page_size`: **4096 bytes**.
+
+Для адреси `initialized global` із Run 1 (`0x654bfd15b010`):
+
+```
+Page Number = A / 4096 = 0x654bfd15b  (27191660891)
+Offset      = A % 4096 = 0x10         (16)
+```
+
+Тобто адреса складається зі сторінки (всі біти, крім молодших 12) і зсуву всередині неї. Цим пояснюється, чому закінчення адрес `…010`, `…01c` не змінюється між запусками: змінюється лише номер сторінки, а offset у сторінці лишається тим самим.
+
+## 4. VmSize / VmRSS до і після touching memory
+
+`heap_growth` (запуск 1):
+
+| | VmSize | VmRSS |
+|---|---|---|
+| До touch (t = 1 s) | 105092 kB | 1680 kB |
+| Після touch (t = 4 s) | 105092 kB | 104076 kB |
+
+Другий запуск дав те саме: `VmRSS` 1712 kB → 104108 kB.
+
+**Прогноз:** виросте, бо додаються дані в пам'ять.
+
+`VmSize` (virtual size) уже після `malloc(100 MB)` включає ці 100 MB (105092 kB), але `VmRSS` (реальна пам'ять у RAM) лишилась близько 1.7 MB. Після запису в кожну сторінку (крок 4096 bytes) `VmRSS` виросла на ≈ 102 396 kB, тобто майже рівно на 100 MiB (102 400 kB), бо кожна «торкнута» сторінка вперше отримала physical frame.
+
+Висновок: `malloc(100 MB)` лише резервує virtual address space. Physical RAM виділяється пізніше, при першому доступі до сторінки (page fault). Також адреса виділеного блоку (`0x714c9948f010`) не лежить поруч з `[heap]`, імовірно, великий блок allocator взяв окремим mmap-mapping.
+
+**Збіг з прогнозом:** частково. `VmRSS` справді виросла, але не після `malloc(100 MB)`, а лише після запису в кожну сторінку. Тоді я не розрізняв ці два моменти: `malloc` резервує лише virtual memory.
+
+## 5. Invalid memory access
+
+```
+$ ./invalid_memory
+About to access invalid memory
+Segmentation fault (core dumped)
+exit code: 139
+```
+
+`strace ./invalid_memory` закінчується так:
+
+```
+write(1, "About to access invalid memory\n", 31...) = 31
+--- SIGSEGV {si_signo=SIGSEGV, si_code=SEGV_MAPERR, si_addr=NULL} ---
++++ killed by SIGSEGV (core dumped) +++
+```
+
+Process намагається записати за virtual address 0. Для цієї адреси немає дійсного mapping, тому hardware (MMU) генерує fault, kernel його обробляє й надсилає process фатальний сигнал `SIGSEGV`. Код завершення 139 = 128 + 11 (номер сигналу). Останній `printf` не виконався.
+
+- OS не дозволяє записувати за адресу 0, бо вона не належить жодному mapping process.
+- Це захищає систему: помилка в одній програмі не може довільно змінити чужу пам'ять чи пам'ять kernel.
+- Segmentation fault не означає, що RAM фізично зламана. Це логічна помилка доступу до адреси, яка не відображена.
+
+Core dump після запуску не лишився (у репозиторій не додається).
+
+# Частина II. File descriptors та I/O
+
+## 6. Результат `/proc/PID/fd`
+
+`fd_observer` (PID 27479):
+
+```
+0  -> /dev/pts/1
+1  -> /dev/pts/1
+2  -> /dev/pts/1
+26 -> /dev/pts/ptmx
+27 -> /home/codespace/.vscode-remote/data/logs/.../mcpGateway.log
+```
+
+Дескриптори 26 і 27 не з моєї програми: імовірно, їх успадкував термінал від середовища VS Code.
+
+## 7. Пояснення 0 / 1 / 2
+
+`standard_fds` вивів `STDIN = 0`, `STDOUT = 1`, `STDERR = 2`. Це стандартні дескриптори process: stdin (вхід), stdout (вихід), stderr (повідомлення про помилки). У моєму Codespace всі три вказують на `/dev/pts/1`, тобто на pseudo-terminal (це емульований термінал, а не фізичний пристрій).
+
+## 8. Результат `open_file.c`
+
+```
+Opened file descriptor: 3
+...
+3 -> /workspaces/c-labs/labs/lab06-memory-io/example.txt
+```
+
+Новий файл отримав fd 3, бо 0, 1, 2 уже зайняті. Код не повинен покладатися на те, що `open()` завжди поверне 3: kernel повертає наступний вільний дескриптор.
+
+## 9. Pathname проти file descriptor
+
+`"example.txt"` — це pathname, рядок, за яким kernel знаходить файл. Після `open()` процес отримує число (fd, тут 3), яке є «ручкою» цього відкритого файлу в таблиці process. `read()` і `write()` далі працюють з дескриптором, не передаючи pathname знову.
+
+```
+"example.txt" ──open()──► Kernel ──► fd 3
+```
+
+`write_file`: запит 19 bytes, записано 19 bytes, у `output.txt` рядок `Hello from write()`.
+
+## 10. File offset та `lseek()`
+
+```
+$ ./file_offset
+First: [Compu]
+Second: [ter S]
+
+$ ./file_offset_lseek
+First: [Compu]
+Second: [Compu]
+```
+
+**Прогноз:** ні, другий `read()` не прочитає ті самі перші п'ять bytes.
+
+Другий `read()` продовжує з поточної position (offset після першого прочитання пересунувся на 5), тому прочитав наступні 5 bytes, а не ті самі. Після `lseek(fd, 0, SEEK_SET)` offset повернувся на початок, і другий `read()` знову прочитав `Compu`.
+
+**Збіг з прогнозом:** так. Другий `read()` прочитав наступні п'ять bytes (`ter S`), бо file offset після першого `read()` зсунувся на 5.
+
+Sequential access — читання по порядку, offset рухається вперед сам. Random access — програма сама переносить offset (`lseek`) у довільне місце й читає звідти.
+
+## 11. Короткий strace для I/O
+
+`strace -e trace=openat,read,write,close ./read_file` (фрагмент):
+
+```
+openat(AT_FDCWD, "input.txt", O_RDONLY) = 3
+read(3, "Computer Systems", 16) = 16
+write(1, "Computer Systems", 16) = 16
+read(3, "\nOperating Syste", 16) = 16
+write(1, "\nOperating Syste", 16) = 16
+read(3, "ms\n", 16) = 3
+write(1, "ms\n", 3) = 3
+read(3, "", 16) = 0
+close(3) = 0
+```
+
+Зіставлення з кодом: `open()` дав fd 3; цикл `read` (буфер 16 bytes) і `write` у stdout повторюється; `read` повернув 0 (EOF), цикл завершився; `close(3)`. Усього файл 36 bytes: 16 + 16 + 3 + EOF.
+
+## 12. stdout / stderr і redirection
+
+```
+--- без redirection ---
+Normal output
+Error output
+--- stdout у файл ---
+Error output                       (на екран)
+вміст normal.txt: Normal output
+--- stderr у файл ---
+Normal output                      (на екран)
+вміст error.txt: Error output
+```
+
+При `> normal.txt` normal output потрапив у файл, а error output лишився на екрані. При `2> error.txt` навпаки. Програма все так само пише в fd 1 і fd 2, але shell перед запуском змінив, на який ресурс вказує дескриптор: було fd 1 → terminal, стало fd 1 → `normal.txt`. Для цього код програми змінювати не потрібно.
+
+## 13. Buffering: `printf()` проти `write()`, `fflush()`
+
+```
+$ ./buffering
+DABC
+$ strace -e write ./buffering
+write(1, "D", 1D) = 1
+write(1, "ABC", 3ABC) = 3
+
+$ ./buffering_flush
+ABCD
+$ strace -e write ./buffering_flush
+write(1, "ABC", 3ABC) = 3
+write(1, "D", 1D) = 1
+```
+
+**Прогноз:** не робив.
+
+Три `printf()` не створили трьох `write()`: літери `A`, `B`, `C` лишалися в stdio buffer і записалися одним `write(1, "ABC", 3)` лише під час завершення програми. А `write(1, "D", 1)` іде напряму в kernel, тому літера D з'явилась першою. `fflush(stdout)` примусово скидає stdio buffer перед `write("D")`, тому порядок став ABCD.
+
+Висновок: порядок команд у програмі не завжди збігається з порядком появи зовнішнього виводу, якщо використовуються різні шари буферизації.
+
+## 14. Реалізація та перевірка `file_copy`
+
+`file_copy.c` використовує тільки `open()`, `read()`, `write()` і `close()` (без `fopen`, `fread`, `fwrite` та `system("cp")`). Логіка:
+
+- перевіряє кількість аргументів (`Usage: ...`);
+- відкриває source (`O_RDONLY`), потім destination (`O_WRONLY | O_CREAT | O_TRUNC`, 0644); якщо destination не відкрився, закриває source;
+- читає блоками по 4096 bytes (`BUFFER_SIZE`);
+- кожен прочитаний блок записує циклом, який враховує **partial write**: якщо `write()` записав менше, ніж просили, продовжує з `buffer + total_written`;
+- повторює `read`/`write` при `EINTR`;
+- перевіряє помилки `open`, `read`, `write` і `close`, повертає `EXIT_FAILURE` при будь-якій з них.
+
+Результати перевірки:
+
+| Тест | Результат |
+|---|---|
+| `./file_copy source.txt destination.txt` | exit 0, `cmp` без виводу, exit 0 |
+| `./file_copy file_copy copy_of_file_copy` (binary) | exit 0, `cmp` exit 0 |
+| порожній файл | exit 0, `cmp` exit 0 |
+| без аргументів | `Usage: ./file_copy <source> <destination>`, exit 1 |
+| неіснуючий source | `open source: No such file or directory`, exit 1 |
+| неможливий destination (`/no_such_dir/out.txt`) | `open destination: No such file or directory`, exit 1 |
+
+Той самий цикл копіює і text, і binary executable, бо на цьому рівні програма працює з **bytes**, а не з «текстом» як окремою формою даних.
+
+## 15. strace для `file_copy`
+
+```
+openat(AT_FDCWD, "source.txt", O_RDONLY) = 3
+openat(AT_FDCWD, "destination.txt", O_WRONLY|O_CREAT|O_TRUNC, 0644) = 4
+read(3, "Operating Systems\nComputer Archi"..., 4096) = 40
+write(4, "Operating Systems\nComputer Archi"..., 40) = 40
+read(3, "", 4096) = 0
+close(3) = 0
+close(4) = 0
+```
+
+Зіставлення: перший `openat` це `open(argv[1], O_RDONLY)` (source, fd 3); другий це `open(argv[2], ...)` (destination, fd 4); `read` прочитав 40 bytes; `write` записав усі 40 в fd 4 (partial write не стався); другий `read` повернув 0 (EOF) і цикл завершився; потім два `close`.
+
+## 16. Повна схема data path
+
+```
+SOURCE FILE
+     │
+     │ read(source, buffer, 4096)
+     ▼
+════════════════════════════
+         Kernel
+════════════════════════════
+     │
+     ▼
+Process Virtual Memory
+     │
+     │ buffer[4096]
+     ▼
+════════════════════════════
+         Kernel
+════════════════════════════
+     │
+     │ write(destination, buffer, n)
+     ▼
+DESTINATION FILE
+```
+
+**Інтеграційне питання (`char buffer[4096]; read(fd, buffer, sizeof(buffer));`).** `buffer` — це масив у virtual memory process (локальна змінна, лежить у stack). Його адреса є virtual address, яка складається зі сторінки та offset, а MMU перетворює її на physical address. `fd` — це число, handle відкритого файлу в process. Коли програма викликає `read()`, відбувається system call: керування переходить через межу user/kernel до kernel. Kernel за `fd` знаходить відкритий файл, виконує сам I/O і копіює прочитані дані за virtual address `buffer` у пам'ять процесу. Після повернення з `read()` у `buffer` лежать дані, а повернене значення каже, скільки bytes прочитано (0 означає EOF).
+
+## 17. Відповіді на контрольні питання
+
+1. **Virtual address** — адреса, яку бачить програма в межах свого address space.
+2. **Physical address** вказує на реальне місце в RAM. Virtual address перетворюється на physical через MMU та page table.
+3. **Virtual address space** — набір virtual addresses, доступних process, з окремими областями (code, data, heap, stack, libraries).
+4. Бо в кожного process свій address space і своя таблиця відображення, тому те саме число вказує на різні physical сторінки (у `fork_memory` з Lab 4 адреса однакова, а значення різні).
+5. **Page** — фіксований блок virtual memory (у мене 4096 bytes).
+6. **Page frame** — блок physical RAM того самого розміру, у який відображається page.
+7. **Page table** — структура, яка зіставляє virtual pages з page frames.
+8. **MMU** — апаратний модуль CPU, який перекладає virtual address у physical і перевіряє права доступу.
+9. **TLB** — маленький кеш недавніх перетворень virtual → physical, щоб не звертатися до page table щоразу.
+10. **TLB miss** — перетворення не знайшлося в TLB, його беруть з page table (сторінка при цьому в пам'яті є). **Page fault** — потрібної сторінки немає в пам'яті або відображення недійсне, і керування передається OS.
+11. **Page fault** — виняток, коли process звертається до сторінки, яка зараз недоступна (ще не завантажена, не виділена або заборонена).
+12. Ні. Page fault при першому доступі до щойно виділеної пам'яті (як у `heap_growth`) нормальний, так OS виділяє physical RAM. Помилкою є fault, для якого немає дійсного mapping (`SIGSEGV`).
+13. Кожен process має власний address space, і не може адресувати чужу пам'ять, якщо OS її не відобразила.
+14. `r` — читання, `w` — запис, `x` — виконання, `p` — private mapping.
+15. Бо програма не повинна змінювати власні instructions: це захищає від помилок і атак.
+16. Бо `malloc()` лише резервує virtual address space. Physical RAM виділяється при першому доступі до сторінки (у моєму експерименті `VmRSS` виросла лише після запису).
+17. **File descriptor** — невід'ємне ціле число, handle відкритого файлу чи іншого I/O resource у process.
+18. **Pathname** — ім'я файлу в файловій системі. **File descriptor** — число, яке kernel повертає після `open()` для подальших `read`/`write`.
+19. 0 — stdin, 1 — stdout, 2 — stderr.
+20. `open()` відкриває файл за pathname і повертає file descriptor (або -1 при помилці).
+21. `read()` повертає кількість прочитаних bytes, 0 при EOF і -1 при помилці.
+22. Кінець файлу (EOF): більше даних немає.
+23. `write()` повертає кількість записаних bytes або -1 при помилці.
+24. Бо `write()` може записати менше, ніж запросили, і тоді залишок треба дописати, інакше дані втрачаться.
+25. **File offset** — поточна позиція у відкритому файлі, з якої виконається наступний `read`/`write`. Вона рухається після кожної операції.
+26. `lseek()` переміщує file offset (наприклад, на початок через `SEEK_SET`).
+27. `FILE *` — структура C standard library з власним буфером, яка обгортає file descriptor. File descriptor — це низькорівневий handle від kernel.
+28. Бо stdio накопичує вивід у власному буфері й записує його пізніше (у `buffering` літери ABC пішли одним `write` вже після D).
+29. **Buffering** — накопичення даних у буфері для зменшення кількості дорогих system calls.
+30. `fflush()` скидає буфер потоку, тобто змушує записати накопичені дані.
+31. Бо shell змінює, на який ресурс вказує fd 1 (або 2), а програма продовжує писати в той самий дескриптор.
+32. Бо цикл `read`/`write` працює з bytes і не залежить від того, чи це текст, чи executable.
+33. У virtual memory process (у `file_copy` це масив `buffer[4096]` у stack).
+34. Програма викликає `read(fd, buffer, n)`, переходить у kernel через system call; kernel за `fd` знаходить файл, виконує I/O і копіює дані у virtual memory `buffer` процесу. Тому у процесі `fd` — handle, `buffer` — virtual memory, а system call — міст між ними.
+
+## 18. Висновок
+
+У цій лабораторній я побачив, що адреси, які друкує програма, — це virtual addresses, і що їх можна знайти в `/proc/PID/maps` (code, heap, stack, libraries) з різними правами доступу. `malloc(100 MB)` збільшив `VmSize`, але `VmRSS` виросла лише після запису в сторінки. Це демонструє відділення virtual memory від physical RAM, а звернення за адресою 0 закінчилось `SIGSEGV` завдяки memory protection. У другій частині я працював з file descriptors: `open()` дав fd 3, `read()`/`write()`/`close()` утворили повний цикл, а file offset і `lseek()` показали, що позиція зберігається між викликами. Redirection змінив, куди веде fd 1 без зміни коду, а експеримент з буфером показав, що `printf` і `write` мають різні шари буферизації. Власний `file_copy` з обробкою partial write скопіював і text, і binary, об'єднавши virtual memory та file I/O.
